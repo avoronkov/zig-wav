@@ -1,20 +1,37 @@
 const std = @import("std");
-const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Make module available as dependency.
-    _ = b.addModule("wav", .{ .source_file = .{ .path = "src/wav.zig" } });
+    const lib_mod = b.createModule(.{
+        .root_source_file = b.path("src/wav.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
-    const test_step = b.step("test", "Run library tests");
-    inline for ([_][]const u8{ "src/sample.zig", "src/wav.zig" }) |test_file| {
-        const t = b.addTest(.{
-            .root_source_file = .{ .path = test_file },
-            .target = target,
-            .optimize = optimize,
-        });
-        test_step.dependOn(&t.step);
-    }
+
+    // Now, we will create a static library based on the module we created above.
+    // This creates a `std.Build.Step.Compile`, which is the build step responsible
+    // for actually invoking the compiler.
+    const lib = b.addLibrary(.{
+        .linkage = .static,
+        .name = "wav",
+        .root_module = lib_mod,
+    });
+
+    b.installArtifact(lib);
+
+    const lib_unit_tests = b.addTest(.{
+        .root_module = lib_mod,
+    });
+
+    const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
+
+
+    // Similar to creating the run step earlier, this exposes a `test` step to
+    // the `zig build --help` menu, providing a way for the user to request
+    // running the unit tests.
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&run_lib_unit_tests.step);
 }
