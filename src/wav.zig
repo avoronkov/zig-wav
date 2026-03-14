@@ -200,15 +200,17 @@ pub const Decoder = struct {
         const limit = buf.len;
         var i: usize = 0;
         while (i < limit) : (i += 1) {
-            buf[i] = sample.convert(
-                T,
-                // Propagate EndOfStream error on truncation.
-                switch (@typeInfo(S)) {
-                    .float => try readFloat(S, self.reader),
-                    .int => try self.reader.takeInt(S, .little),
-                    else => @compileError(bad_type),
-                },
-                );
+            const v: S = switch (@typeInfo(S)) {
+                .float => readFloat(S, self.reader),
+                .int => self.reader.takeInt(S, .little),
+                else => @compileError(bad_type),
+            } catch |err| {
+                if (err == error.EndOfStream and i > 0) {
+                    return i;
+                }
+                return err;
+            };
+            buf[i] = sample.convert(T, v);
         }
         return i;
     }
