@@ -224,26 +224,23 @@ pub fn decoder(reader: *std.Io.Reader) !Decoder {
 /// with type T (PCM int or IEEE float).
 pub fn Encoder(
     comptime T: type,
-    comptime WriterType: type,
     comptime SeekableType: type,
 ) type {
     return struct {
         const Self = @This();
 
-        const Error = WriterType.Error || SeekableType.SeekError || error{ InvalidArgument, Overflow };
-
-        writer: WriterType,
+        writer: *std.Io.Writer,
         seekable: SeekableType,
 
         fmt: FormatChunk,
         data_size: usize = 0,
 
         pub fn init(
-            writer: WriterType,
+            writer: *std.Io.Writer,
             seekable: SeekableType,
             sample_rate: usize,
             channels: usize,
-        ) Error!Self {
+        ) !Self {
             const bits = switch (T) {
                 u8 => 8,
                 i16 => 16,
@@ -290,7 +287,7 @@ pub fn Encoder(
         /// Write samples of type S to stream after converting to type T. Supports PCM encoded ints and
         /// IEEE float. Multi-channel samples must be interleaved: samples for time `t` for all channels
         /// are written to `t * channels`.
-        pub fn write(self: *Self, comptime S: type, buf: []const S) Error!void {
+        pub fn write(self: *Self, comptime S: type, buf: []const S) !void {
             switch (T) {
                 u8,
                 i16,
@@ -312,7 +309,7 @@ pub fn Encoder(
             }
         }
 
-        fn writeHeader(self: *Self) Error!void {
+        fn writeHeader(self: *Self) !void {
             // Size of RIFF header + fmt id/size + fmt chunk + data id/size.
             const header_size: usize = 12 + 8 + @sizeOf(@TypeOf(self.fmt)) + 8;
 
@@ -326,14 +323,14 @@ pub fn Encoder(
 
             try self.writer.writeAll("fmt ");
             try self.writer.writeInt(u32, @sizeOf(@TypeOf(self.fmt)), .little);
-            try self.writer.writeStruct(self.fmt);
+            try self.writer.writeStruct(self.fmt, .little);
 
             try self.writer.writeAll("data");
             try self.writer.writeInt(u32, @intCast(self.data_size), .little);
         }
 
         /// Must be called once writing is complete. Writes total size to file header.
-        pub fn finalize(self: *Self) Error!void {
+        pub fn finalize(self: *Self) !void {
             try self.seekable.seekTo(0);
             try self.writeHeader();
         }
@@ -342,12 +339,12 @@ pub fn Encoder(
 
 pub fn encoder(
     comptime T: type,
-    writer: anytype,
+    writer: *std.Io.Writer,
     seekable: anytype,
     sample_rate: usize,
     channels: usize,
-) !Encoder(T, @TypeOf(writer), @TypeOf(seekable)) {
-    return Encoder(T, @TypeOf(writer), @TypeOf(seekable)).init(writer, seekable, sample_rate, channels);
+) !Encoder(T, @TypeOf(seekable)) {
+    return Encoder(T, @TypeOf(seekable)).init(writer, seekable, sample_rate, channels);
 }
 
 test "pcm(bits=8) sample_rate=22050 channels=1" {
@@ -510,48 +507,58 @@ test "error data_size too big" {
     try expectError(error.EndOfStream, wav_decoder.read(u8, &buf));
 }
 
-// fn testEncodeDecode(comptime T: type, comptime sample_rate: usize) !void {
-//     const twopi = std.math.pi * 2.0;
-//     const freq = 440.0;
-//     const secs = 3;
-//     const sr: f32 = @floatFromInt(sample_rate);
-//     const increment = freq / sr * twopi;
-// 
-//     const buf = try std.testing.allocator.alloc(u8, sample_rate * @bitSizeOf(T) / 8 * (secs + 1));
-//     defer std.testing.allocator.free(buf);
-// 
-//     var stream = std.io.fixedBufferStream(buf);
-//     var wav_encoder = try encoder(T, stream.writer(), stream.seekableStream(), sample_rate, 1);
-// 
-//     var phase: f32 = 0.0;
-//     var i: usize = 0;
-//     while (i < secs * sample_rate) : (i += 1) {
-//         try wav_encoder.write(f32, &.{std.math.sin(phase)});
-//         phase += increment;
-//     }
-// 
-//     try wav_encoder.finalize();
-//     try stream.seekTo(0);
-// 
-//     var wav_decoder = try decoder(stream.reader());
-//     try expectEqual(sample_rate, wav_decoder.sampleRate());
-//     try expectEqual(@as(usize, 1), wav_decoder.channels());
-//     try expectEqual(secs * sample_rate, wav_decoder.remaining());
-// 
-//     phase = 0.0;
-//     i = 0;
-//     while (i < secs * sample_rate) : (i += 1) {
-//         var value: [1]f32 = undefined;
-//         try expectEqual(try wav_decoder.read(f32, &value), 1);
-//         try std.testing.expectApproxEqAbs(std.math.sin(phase), value[0], 0.0001);
-//         phase += increment;
-//     }
-// 
-//     try expectEqual(@as(usize, 0), wav_decoder.remaining());
-// }
-// 
-// test "encode-decode sine" {
-//     try testEncodeDecode(f32, 44100);
-//     try testEncodeDecode(i24, 48000);
-//     try testEncodeDecode(i16, 44100);
-// }
+const SeekableFixedWriter = struct {
+    writer: *std.Io.Writer,
+    fn seekTo(self: *SeekableFixedWriter, pos: usize) !void {
+        self.writer.end = pos;
+    }
+};
+
+fn testEncodeDecode(comptime T: type, comptime sample_rate: usize) !void {
+    const twopi = std.math.pi * 2.0;
+    const freq = 440.0;
+    const secs = 3;
+    const sr: f32 = @floatFromInt(sample_rate);
+    const increment = freq / sr * twopi;
+
+    const buf = try std.testing.allocator.alloc(u8, sample_rate * @bitSizeOf(T) / 8 * (secs + 1));
+    defer std.testing.allocator.free(buf);
+
+    // var stream = std.io.fixedBufferStream(buf);
+    var stream = std.Io.Writer.fixed(buf);
+    var seekableStream = SeekableFixedWriter{ .writer = &stream };
+    var wav_encoder = try encoder(T, &stream, &seekableStream, sample_rate, 1);
+
+    var phase: f32 = 0.0;
+    var i: usize = 0;
+    while (i < secs * sample_rate) : (i += 1) {
+        try wav_encoder.write(f32, &.{std.math.sin(phase)});
+        phase += increment;
+    }
+
+    try wav_encoder.finalize();
+    try seekableStream.seekTo(0);
+
+    var reader = std.Io.Reader.fixed(buf);
+    var wav_decoder = try decoder(&reader);
+    try expectEqual(sample_rate, wav_decoder.sampleRate());
+    try expectEqual(@as(usize, 1), wav_decoder.channels());
+    // try expectEqual(secs * sample_rate, wav_decoder.remaining());
+
+    phase = 0.0;
+    i = 0;
+    while (i < secs * sample_rate) : (i += 1) {
+        var value: [1]f32 = undefined;
+        try expectEqual(try wav_decoder.read(f32, &value), 1);
+        try std.testing.expectApproxEqAbs(std.math.sin(phase), value[0], 0.0001);
+        phase += increment;
+    }
+
+    // try expectEqual(@as(usize, 0), wav_decoder.remaining());
+}
+
+test "encode-decode sine" {
+    try testEncodeDecode(f32, 44100);
+    try testEncodeDecode(i24, 48000);
+    try testEncodeDecode(i16, 44100);
+}
